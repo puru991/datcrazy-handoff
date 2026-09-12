@@ -1,0 +1,52 @@
+{
+  "name": "datcrazy-handoff",
+  "version": "0.1.0",
+  "description": "Autonomous, durable session handoff for the Pi coding agent: summarize, swap to a fresh session, and continue without a human pressing /new.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "datcrazy",
+    "handoff",
+    "session-handoff",
+    "context",
+    "continuation",
+    "autonomous"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "homepage": "https://pi.datcrazy.co",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/puru991/datcrazy-remote.git",
+    "directory": "packages/datcrazy-handoff"
+  },
+  "author": "datcrazy",
+  "devDependencies": {
+    "@types/node": "^25.8.0",
+    "typescript": "^6.0.3"
+  }
+}
