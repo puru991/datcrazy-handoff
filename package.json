@@ -41,8 +41,7 @@
   "homepage": "https://pi.datcrazy.co",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/puru991/datcrazy-remote.git",
-    "directory": "packages/datcrazy-handoff"
+    "url": "git+https://github.com/puru991/datcrazy-handoff.git"
   },
   "author": "datcrazy",
   "devDependencies": {

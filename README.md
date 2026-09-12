@@ -14,6 +14,8 @@ already on disk: the next session in that folder resumes it automatically.
 
 ## Install
 
+Source: <https://github.com/puru991/datcrazy-handoff> (MIT).
+
 ```bash
 pi install npm:datcrazy-handoff
 # or from a checkout:
