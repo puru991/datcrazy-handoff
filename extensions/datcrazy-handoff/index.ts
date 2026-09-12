@@ -38,6 +38,7 @@ import {
   type HandoffInput,
 } from "./artifact.ts";
 import { createHandoffController, type HandoffController, type NotifyLevel } from "./swap.ts";
+import { spawnSuccessor, type SpawnResult } from "./successor.ts";
 
 const TOOL_NAME = "handoff";
 const COMMAND_NAME = "datcrazy-handoff";
@@ -52,7 +53,27 @@ type ToolResult = {
 };
 
 /** Outcome of trying to arm an in-process swap from this session. */
-export type ArmStatus = "armed" | "no-command-ctx" | "unsupported";
+export type ArmStatus = "armed" | "spawned" | "no-command-ctx" | "unsupported";
+
+/** Session facts a successor process needs; filled from whichever ctx we hold. */
+export interface SpawnOptions {
+  sessionDir?: string;
+  provider?: string;
+  model?: string;
+}
+
+/** Test seam: the successor launcher is injected, like the pi instance is. */
+let _spawnSuccessor: (spec: {
+  cwd: string;
+  continuation: string;
+  sessionDir?: string;
+  provider?: string;
+  model?: string;
+}) => SpawnResult = spawnSuccessor;
+
+export function _setSpawnForTest(fn: typeof _spawnSuccessor | null): void {
+  _spawnSuccessor = fn ?? spawnSuccessor;
+}
 
 /** Runtime published for other addons (datcrazy-remote delegates here). */
 export interface HandoffRuntimeV1 {
@@ -63,6 +84,9 @@ export interface HandoffRuntimeV1 {
       cwd?: string;
       parentSession?: string;
       artifactPath?: string;
+      sessionDir?: string;
+      provider?: string;
+      model?: string;
       notify?: (text: string, level?: NotifyLevel) => void;
     },
   ): Promise<ArmStatus>;
@@ -81,7 +105,13 @@ let _armNotify: ((text: string, level?: NotifyLevel) => void) | null = null;
 
 function isPrintMode(): boolean {
   const argv = process.argv;
-  return argv.includes("-p") || argv.includes("--print");
+  if (argv.includes("-p") || argv.includes("--print")) return true;
+  const modeAt = argv.findIndex((a) => a === "--mode");
+  if (modeAt !== -1) {
+    const mode = argv[modeAt + 1];
+    if (mode === "text" || mode === "json") return true;
+  }
+  return false;
 }
 
 function safeCwd(ctx: Pick<ExtensionContext, "cwd"> | null): string | null {
@@ -217,16 +247,30 @@ function resetController(): void {
  * way for a tool to reach a command ctx), then hands the work to the
  * controller, which waits for an idle tick.
  */
+interface ArmOptions {
+  cwd: string;
+  parentSession?: string;
+  artifactPath?: string;
+  notifyOverride?: (text: string, level?: NotifyLevel) => void;
+  spawn?: SpawnOptions;
+}
+
+/**
+ * Arms a fresh-session continuation. Acquires a real command context by
+ * dispatching our own command through the user-message path (the documented
+ * way for a tool to reach a command ctx), then hands the work to the
+ * controller, which waits for an idle tick.
+ *
+ * When there is no live session to swap (print mode) or the host does not
+ * dispatch commands, a successor process takes the continuation instead — the
+ * durable seed stays in place if even that fails.
+ */
 async function armContinuation(
   continuation: string,
-  opts: {
-    cwd: string;
-    parentSession?: string;
-    artifactPath?: string;
-    notifyOverride?: (text: string, level?: NotifyLevel) => void;
-  },
+  opts: ArmOptions,
 ): Promise<ArmStatus> {
-  if (!_pi || isPrintMode()) return "unsupported";
+  if (!_pi) return "unsupported";
+  if (isPrintMode()) return spawnSuccessorFor(continuation, opts, "unsupported");
   const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   _armToken = token;
   _armAck = "";
@@ -236,12 +280,12 @@ async function armContinuation(
   } catch {
     _armNotify = null;
     _armToken = "";
-    return "no-command-ctx";
+    return spawnSuccessorFor(continuation, opts, "no-command-ctx");
   }
   if (_armAck !== token) {
     _armNotify = null;
     _armToken = "";
-    return "no-command-ctx";
+    return spawnSuccessorFor(continuation, opts, "no-command-ctx");
   }
   controller().arm({
     kind: "swap",
@@ -254,6 +298,52 @@ async function armContinuation(
   return "armed";
 }
 
+/**
+ * Starts a successor pi process for the continuation and consumes the seed on
+ * success. `onFailure` is returned untouched when no successor can be started,
+ * so the caller keeps its durable-seed message.
+ */
+function spawnSuccessorFor(
+  continuation: string,
+  opts: ArmOptions,
+  onFailure: ArmStatus,
+): ArmStatus {
+  const result = _spawnSuccessor({
+    cwd: opts.cwd,
+    continuation,
+    sessionDir: opts.spawn?.sessionDir,
+    provider: opts.spawn?.provider,
+    model: opts.spawn?.model,
+  });
+  if (!result.ok) return onFailure;
+  unlinkSeed(opts.cwd);
+  notify(
+    `Handoff: successor session started in ${opts.cwd} (pid ${result.pid}). ` +
+      `This process can stop; the work continues there. Log: ${result.logPath}`,
+    "info",
+  );
+  return "spawned";
+}
+
+/** Session facts for a successor, read defensively off any ctx. */
+function spawnOptionsFromCtx(
+  ctx: Pick<ExtensionContext, "model" | "sessionManager"> | null,
+): SpawnOptions {
+  const out: SpawnOptions = {};
+  try {
+    const dir = ctx?.sessionManager?.getSessionDir?.();
+    if (dir) out.sessionDir = dir;
+  } catch { /* best effort */ }
+  try {
+    const model = ctx?.model;
+    if (model?.provider && model?.id) {
+      out.provider = model.provider;
+      out.model = model.id;
+    }
+  } catch { /* best effort */ }
+  return out;
+}
+
 /** Registry/remote entry point — same arming path, explicit options. */
 async function armSwap(
   continuation: string,
@@ -261,6 +351,9 @@ async function armSwap(
     cwd?: string;
     parentSession?: string;
     artifactPath?: string;
+    sessionDir?: string;
+    provider?: string;
+    model?: string;
     notify?: (text: string, level?: NotifyLevel) => void;
   },
 ): Promise<ArmStatus> {
@@ -270,6 +363,7 @@ async function armSwap(
     parentSession: opts?.parentSession,
     artifactPath: opts?.artifactPath,
     notifyOverride: opts?.notify,
+    spawn: { sessionDir: opts?.sessionDir, provider: opts?.provider, model: opts?.model },
   });
 }
 
@@ -284,8 +378,9 @@ const extension = (pi: ExtensionAPI): void => {
     label: "Handoff",
     description:
       "Persist a handoff summary for this work and continue it in a fresh session. " +
-      "The summary, artifact path and continuation seed are durable: if the session " +
-      "cannot be replaced in place, the next session in the same folder resumes it.",
+      "The summary, artifact path and continuation seed are durable: when the session " +
+      "cannot be replaced in place, a successor process continues the work, and failing " +
+      "that the next session in the same folder resumes it.",
     promptSnippet:
       "Hand off to a fresh session: save a summary, swap sessions, continue automatically",
     promptGuidelines: [
@@ -371,6 +466,7 @@ const extension = (pi: ExtensionAPI): void => {
         cwd: rootDecision.root,
         parentSession: written.artifact.session_file || undefined,
         artifactPath: written.path,
+        spawn: spawnOptionsFromCtx(ctx),
       });
 
       if (status === "armed") {
@@ -381,6 +477,20 @@ const extension = (pi: ExtensionAPI): void => {
               text:
                 `Handoff saved (${written.path}). A fresh session starts as soon as this ` +
                 "turn ends and continues from the summary.",
+            },
+          ],
+          details: { ok: true, handoffPath: written.path, status },
+        };
+      }
+      if (status === "spawned") {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Handoff saved (${written.path}). This run cannot replace its own session, so a ` +
+                "successor pi process was started in the same folder and is continuing the work " +
+                "now. You may stop here.",
             },
           ],
           details: { ok: true, handoffPath: written.path, status },
@@ -511,9 +621,12 @@ const extension = (pi: ExtensionAPI): void => {
           cwd,
           artifactPath,
           notifyOverride: (text, level) => ctx.ui?.notify?.(text, level ?? "info"),
+          spawn: spawnOptionsFromCtx(ctx),
         });
         if (status === "armed") {
           notify("Handoff armed: a fresh session starts as soon as this turn ends.", "info");
+        } else if (status === "spawned") {
+          notify("Handoff: a successor pi process is continuing this work in the same folder.", "info");
         } else if (status === "no-command-ctx") {
           notify(
             "Could not acquire a session swap context. The seed is saved; start a new session (/new) and it resumes.",

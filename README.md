@@ -76,18 +76,30 @@ Three Pi constraints shape the design; each one is covered by a test.
 3. **A handoff must survive everything.** The artifact and the per-folder seed
    are written *before* any swap attempt, so a crash, a killed process, a native
    `/new`, or a restart still resumes the work. A failed or cancelled swap
-   re-writes the seed; a delivered one consumes it.
+   re-writes the seed; a delivered one consumes it. When the process cannot
+   replace its own session, a successor process continues the work instead — see
+   below.
 
 Folder identity is canonicalized (realpath, slash style, case on Windows), so a
 handoff written at `C:/x/proj` is found by a session booting in `C:\x\proj`.
 
 ## When it cannot swap in place
 
-- **`pi -p` / `--print`** — no session to continue; the seed waits for the next
-  interactive session in that folder.
-- **No command dispatch** (a host that does not run extension commands from
-  user messages) — the tool reports `no-command-ctx` and the seed is still
-  durable: `/datcrazy-handoff resume` or `/new` resumes it.
+A handoff never dead-ends. In order of preference:
+
+1. **Fresh session in this process** — the normal path: a real command context is
+   acquired, and the session is replaced when the turn settles.
+2. **Successor process** — when there is no live session to replace (`pi -p`,
+   `--mode text|json`) or the host does not dispatch extension commands from user
+   messages, a detached `pi --print` process is started in the same folder with the
+   continuation on its stdin. It inherits your provider, model, thinking level,
+   extension/skill/tool flags and session dir; it does not inherit the parent's
+   session, name, prompt or API keys. Output lands in
+   `~/.pi/datcrazy/handoff/logs/successor-<utc>.log`; a generation counter stops a
+   chain at 25 restarts.
+3. **Durable seed** — if no successor can be started either (an embedded host with
+   no `pi` entry point), the continuation waits on disk: `/datcrazy-handoff resume`
+   or the next session in that folder picks it up.
 
 ## Interop
 
@@ -124,6 +136,7 @@ Storage layout:
 ~/.pi/datcrazy/handoff/
   artifacts/<utc>-<slug>/handoff.json   # schema 1: summary, goal, artifacts, questions, continuation prompt
   seeds/seed-<slug>-<hash>.json         # per-folder, one-shot continuation
+  logs/successor-<utc>.log              # output of successor processes
 ```
 
 ## License

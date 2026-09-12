@@ -10,6 +10,7 @@ process.env.DATCRAZY_HANDOFF_TICK_MS = "5";
 process.env.DATCRAZY_HANDOFF_SWAP_TIMEOUT_MS = "2000";
 
 const extension = (await import("../extensions/datcrazy-handoff/index.ts")).default;
+const { _setSpawnForTest } = await import("../extensions/datcrazy-handoff/index.ts");
 const { readSeed, seedPathFor, writeHandoffArtifact, writeSeed } = await import(
   "../extensions/datcrazy-handoff/artifact.ts"
 );
@@ -312,6 +313,76 @@ test("another folder's handoff is never resumed here", async () => {
 
   await harness.state.commands.get("datcrazy-handoff").handler("list", harness.commandCtx);
   assert.match(harness.state.notified.at(-1).text, /No handoff artifacts for this folder/);
+});
+
+test("print mode starts a successor process instead of waiting for a session", async () => {
+  const harness = createHarness(freshCwd("print"));
+  extension(harness.pi);
+  await boot(harness);
+  const originalArgv = [...process.argv];
+  process.argv.push("-p");
+  const calls = [];
+  _setSpawnForTest((spec) => {
+    calls.push(spec);
+    return { ok: true, pid: 4242, logPath: "/logs/successor.log" };
+  });
+  try {
+    const result = await harness.callTool({ summary: "print mode work" });
+    assert.equal(result.details.status, "spawned");
+    assert.match(result.content[0].text, /successor pi process/);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].continuation, /print mode work/);
+    assert.equal(calls[0].cwd, harness.cwd);
+    assert.equal(
+      existsSync(seedPathFor(harness.cwd)),
+      false,
+      "the successor carries the text, so the seed is consumed",
+    );
+    assert.ok(
+      harness.state.notified.some((n) => /successor session started/.test(n.text)),
+      "the successor is announced with its log path",
+    );
+  } finally {
+    _setSpawnForTest(null);
+    process.argv.length = 0;
+    process.argv.push(...originalArgv);
+  }
+});
+
+test("print mode keeps the durable seed when no successor can start", async () => {
+  const harness = createHarness(freshCwd("print-nospawn"));
+  extension(harness.pi);
+  await boot(harness);
+  const originalArgv = [...process.argv];
+  process.argv.push("-p");
+  try {
+    const result = await harness.callTool({ summary: "cannot spawn here" });
+    assert.equal(result.details.status, "unsupported");
+    assert.ok(readSeed(harness.cwd), "the seed waits for the next session");
+  } finally {
+    process.argv.length = 0;
+    process.argv.push(...originalArgv);
+  }
+});
+
+test("a host without command dispatch gets a successor process", async () => {
+  const harness = createHarness(freshCwd("nodispatch-spawn"), { dispatchCommands: false });
+  extension(harness.pi);
+  await boot(harness);
+  const calls = [];
+  _setSpawnForTest((spec) => {
+    calls.push(spec);
+    return { ok: true, pid: 777, logPath: "/logs/s.log" };
+  });
+  try {
+    const result = await harness.callTool({ summary: "dispatch is broken here" });
+    assert.equal(result.details.status, "spawned");
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].continuation, /dispatch is broken here/);
+    assert.equal(existsSync(seedPathFor(harness.cwd)), false);
+  } finally {
+    _setSpawnForTest(null);
+  }
 });
 
 test("the interop runtime arms a swap for another addon", async () => {
