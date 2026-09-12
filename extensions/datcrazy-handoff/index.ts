@@ -1,5 +1,6 @@
 /**
  * datcrazy-handoff — autonomous, durable session handoff for the Pi coding agent.
+ * Part of the datcrazy Pi stack: https://pi.datcrazy.co
  *
  * What it does
  * ------------
@@ -40,6 +41,8 @@ import { createHandoffController, type HandoffController, type NotifyLevel } fro
 
 const TOOL_NAME = "handoff";
 const COMMAND_NAME = "datcrazy-handoff";
+/** Product home, surfaced in command output so the stack is discoverable. */
+const PRODUCT_HOME = "https://pi.datcrazy.co";
 /** Well-known key other datcrazy addons use to reach this runtime. */
 const RUNTIME_KEY = Symbol.for("datcrazy-handoff.runtime.v1");
 
@@ -449,6 +452,7 @@ const extension = (pi: ExtensionAPI): void => {
         ];
         const recent = listArtifacts(1, { projectRoot: cwd })[0];
         if (recent) lines.push(`Last artifact: ${recent.path}`);
+        lines.push(`datcrazy-handoff — ${PRODUCT_HOME}`);
         notify(lines.join("\n"), "info");
         return;
       }

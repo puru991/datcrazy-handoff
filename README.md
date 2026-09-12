@@ -1,5 +1,7 @@
 # datcrazy-handoff
 
+**Part of the datcrazy Pi stack — <https://pi.datcrazy.co>.**
+
 Autonomous, durable **session handoff** for the [Pi coding agent](https://pi.dev).
 
 Summarize the work, swap to a fresh session, and keep going — without a human
@@ -124,4 +126,4 @@ Storage layout:
 
 ## License
 
-MIT
+MIT — built by datcrazy (<https://pi.datcrazy.co>).
