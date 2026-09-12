@@ -24,9 +24,12 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "typebox";
 
 import {
+  handoffHome,
   listArtifacts,
   readArtifact,
   readSeed,
@@ -44,6 +47,21 @@ const TOOL_NAME = "handoff";
 const COMMAND_NAME = "datcrazy-handoff";
 /** Product home, surfaced in command output so the stack is discoverable. */
 const PRODUCT_HOME = "https://pi.datcrazy.co";
+const PRODUCT_LABEL = "pi.datcrazy.co";
+
+/** Version of the installed package, read once from the package manifest. */
+let _version: string | null = null;
+function addonVersion(): string {
+  if (_version) return _version;
+  try {
+    const manifest = new URL("../../package.json", import.meta.url);
+    const parsed = JSON.parse(readFileSync(manifest, "utf8")) as { version?: string };
+    _version = parsed.version ?? "0.0.0";
+  } catch {
+    _version = "0.0.0";
+  }
+  return _version;
+}
 /** Well-known key other datcrazy addons use to reach this runtime. */
 const RUNTIME_KEY = Symbol.for("datcrazy-handoff.runtime.v1");
 
@@ -367,6 +385,30 @@ async function armSwap(
   });
 }
 
+/**
+ * Makes the product home visible where people actually look: a footer status
+ * slot while the addon is loaded, and a one-time notice per installed version
+ * (the closest thing to a post-install message an extension can have, since
+ * `pi install` prints only pi's own lines).
+ */
+function announceLoad(ctx: ExtensionContext): void {
+  try {
+    const ui = ctx.ui as { setStatus?: (key: string, text: string) => void; notify?: (t: string, l?: string) => void };
+    ui.setStatus?.("datcrazy-handoff", `datcrazy-handoff · ${PRODUCT_LABEL}`);
+  } catch { /* no footer in this mode */ }
+  const version = addonVersion();
+  try {
+    const marker = join(handoffHome(), `.announced-${version}`);
+    if (existsSync(marker)) return;
+    mkdirSync(handoffHome(), { recursive: true });
+    writeFileSync(marker, `${new Date().toISOString()}\n`);
+    ctx.ui?.notify?.(
+      `datcrazy-handoff ${version} installed — handoff docs and the rest of the stack: ${PRODUCT_HOME}`,
+      "info",
+    );
+  } catch { /* best effort: never block a session on an announcement */ }
+}
+
 // ── Extension factory ───────────────────────────────────────────────────────
 
 const extension = (pi: ExtensionAPI): void => {
@@ -528,7 +570,7 @@ const extension = (pi: ExtensionAPI): void => {
   pi.registerCommand(COMMAND_NAME, {
     description:
       "Handoff: summarize this session and continue in a fresh one " +
-      "(status | list | resume [--path <artifact>] | cancel)",
+      `(status | list | resume [--path <artifact>] | cancel) · ${PRODUCT_LABEL}`,
     getArgumentCompletions: async (prefix: string) =>
       ["status", "list", "resume", "cancel"]
         .filter((option) => option.startsWith(prefix))
@@ -655,6 +697,7 @@ const extension = (pi: ExtensionAPI): void => {
     _armToken = "";
     _armAck = "";
     resetController();
+    announceLoad(ctx);
     const reason = (event as { reason?: string } | undefined)?.reason ?? "startup";
     // Reload keeps the same session: replaying a seed there would double-deliver.
     if (reason === "reload" || isPrintMode()) return;

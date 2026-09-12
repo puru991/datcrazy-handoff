@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -48,18 +48,23 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
     freshMessages: [],
     plainMessages: [],
     notified: [],
+    statuses: new Map(),
     failNewSession: false,
     cancelNewSession: false,
     parentSession: "/sessions/parent.jsonl",
   };
 
   const notify = (text, level) => state.notified.push({ text, level: level ?? "info" });
+  const ui = {
+    notify,
+    setStatus: (key, text) => state.statuses.set(key, text),
+  };
 
   const commandCtx = {
     get cwd() {
       return cwd;
     },
-    ui: { notify },
+    ui,
     sessionManager: { getSessionFile: () => state.parentSession },
     isIdle: () => state.idle,
     async newSession(options) {
@@ -68,7 +73,7 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
       if (state.cancelNewSession) return { cancelled: true };
       const fresh = {
         cwd,
-        ui: { notify },
+        ui,
         async sendUserMessage(text) {
           state.freshMessages.push(text);
         },
@@ -80,7 +85,7 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
 
   const ctx = {
     cwd,
-    ui: { notify },
+    ui,
     sessionManager: { getSessionFile: () => state.parentSession },
     isIdle: () => state.idle,
   };
@@ -119,7 +124,7 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
   function callTool(params) {
     return state.tools.get("handoff").execute("call-1", params, undefined, undefined, {
       cwd,
-      ui: { notify },
+      ui,
       sessionManager: { getSessionFile: () => state.parentSession },
     });
   }
@@ -383,6 +388,44 @@ test("a host without command dispatch gets a successor process", async () => {
   } finally {
     _setSpawnForTest(null);
   }
+});
+
+test("loading the addon shows the product home, once per version", async () => {
+  const cwd = freshCwd("announce");
+  const harness = createHarness(cwd);
+  extension(harness.pi);
+  // Earlier tests in this file already booted once, which writes the per-version
+  // announcement marker. Clear it so this test observes the first-load notice.
+  const announceDir = join(home, ".pi", "datcrazy", "handoff");
+  for (const file of readdirSync(announceDir, { withFileTypes: true })) {
+    if (file.name.startsWith(".announced-")) rmSync(join(announceDir, file.name), { force: true });
+  }
+  await boot(harness);
+
+  assert.equal(
+    harness.state.statuses.get("datcrazy-handoff"),
+    "datcrazy-handoff · pi.datcrazy.co",
+    "the footer carries the product home while the addon is loaded",
+  );
+  const notices = harness.state.notified.filter((n) => /pi\.datcrazy\.co/.test(n.text));
+  assert.equal(notices.length, 1, "first load announces the home once");
+  assert.match(notices[0].text, /datcrazy-handoff \d+\.\d+\.\d+ installed/);
+
+  // A later session in the same install must not repeat the announcement.
+  await boot(harness);
+  assert.equal(
+    harness.state.notified.filter((n) => /installed — handoff docs/.test(n.text)).length,
+    1,
+    "the announcement is one-time per version",
+  );
+  assert.equal(harness.state.statuses.get("datcrazy-handoff"), "datcrazy-handoff · pi.datcrazy.co");
+});
+
+test("the command surface names the product home", async () => {
+  const harness = createHarness(freshCwd("cmd-desc"));
+  extension(harness.pi);
+  const described = harness.state.commands.get("datcrazy-handoff");
+  assert.match(described.description, /pi\.datcrazy\.co/);
 });
 
 test("the interop runtime arms a swap for another addon", async () => {

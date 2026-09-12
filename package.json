@@ -19,7 +19,8 @@
   "pi": {
     "extensions": [
       "./extensions"
-    ]
+    ],
+    "image": "https://pi.datcrazy.co/handoff/preview.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
