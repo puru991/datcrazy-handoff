@@ -409,12 +409,16 @@ async function armContinuation(
   })();
   opts.runtime = runtime;
   if (opts.requireRuntime && !runtime) return "unsupported";
-  try {
-    const publishedPath = writeSeed(opts.cwd, continuation, { artifactPath: opts.artifactPath, runtime });
-    opts.seedKey = seedKey(readSeedAtPath(publishedPath, opts.cwd));
-  } catch {
-    // The artifact remains available; swap failure will report the durable gap.
-    opts.seedKey = null;
+  // The tool has already persisted its seed before arming. Reuse that exact
+  // generation rather than creating a timestamp peer with the same payload.
+  if (!opts.seedKey) {
+    try {
+      const publishedPath = writeSeed(opts.cwd, continuation, { artifactPath: opts.artifactPath, runtime });
+      opts.seedKey = seedKey(readSeedAtPath(publishedPath, opts.cwd));
+    } catch {
+      // The artifact remains available; swap failure will report the durable gap.
+      opts.seedKey = null;
+    }
   }
   if (isPrintMode()) return spawnSuccessorFor(continuation, opts, "unsupported");
   const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -650,11 +654,14 @@ const extension = (pi: ExtensionAPI): void => {
         sessionFile: sessionFileOf(ctx),
         runtime,
       });
+      let publishedSeedKey: string | null = null;
       try {
-        writeSeed(rootDecision.root, written.artifact.continuation_prompt, {
+        const publishedPath = writeSeed(rootDecision.root, written.artifact.continuation_prompt, {
           artifactPath: written.path,
           runtime: written.artifact.runtime,
         });
+        publishedSeedKey = seedKey(readSeedAtPath(publishedPath, rootDecision.root));
+        if (!publishedSeedKey) throw new Error("The published continuation seed could not be read back");
       } catch (e) {
         return {
           content: [
@@ -675,6 +682,7 @@ const extension = (pi: ExtensionAPI): void => {
         parentSession: written.artifact.session_file || undefined,
         artifactPath: written.path,
         runtime: written.artifact.runtime,
+        seedKey: publishedSeedKey,
         spawn: spawnOptionsFromCtx(ctx),
         requireRuntime: true,
       });

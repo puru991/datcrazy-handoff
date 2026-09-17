@@ -12,7 +12,7 @@ process.env.DATCRAZY_HANDOFF_SWAP_TIMEOUT_MS = "2000";
 
 const extension = (await import("../extensions/datcrazy-handoff/index.ts")).default;
 const { _setSpawnForTest } = await import("../extensions/datcrazy-handoff/index.ts");
-const { readSeed, seedPathFor, writeHandoffArtifact, writeSeed } = await import(
+const { cwdKey, readSeed, seedPathFor, seedsDir, writeHandoffArtifact, writeSeed } = await import(
   "../extensions/datcrazy-handoff/artifact.ts"
 );
 
@@ -594,6 +594,21 @@ test("new handoffs fail explicitly when the live runtime cannot be captured", as
   await boot(harness);
   const result = await harness.callTool({ summary: "no runtime" });
   assert.equal(result.details.code, "runtime_unavailable");
+  assert.equal(readSeed(harness.cwd), null);
+});
+
+test("tool arming reuses its durable seed instead of publishing a duplicate generation", async () => {
+  const harness = createHarness(freshCwd("single-tool-generation"));
+  extension(harness.pi);
+  await boot(harness);
+  const result = await harness.callTool({ summary: "exactly one durable generation" });
+  assert.equal(result.details.status, "armed");
+  const published = readdirSync(seedsDir()).filter((name) =>
+    name.includes(cwdKey(harness.cwd)) && name.endsWith(".json"));
+  assert.equal(published.length, 1, "tool persistence and arm must own the same generation");
+  harness.state.idle = true;
+  await harness.emit("agent_settled", {});
+  assert.equal(await waitFor(() => harness.state.freshMessages.length === 1), true);
   assert.equal(readSeed(harness.cwd), null);
 });
 
