@@ -27,6 +27,10 @@ export interface ArmedHandoff {
   cwd: string;
   parentSession?: string;
   artifactPath?: string;
+  /** Exact serialized seed owned by this operation, for compare-and-consume. */
+  seedKey?: string;
+  /** Captured active provider/model/thinking selection, if available. */
+  runtime?: { provider: string; model: string; thinking?: string };
 }
 
 export interface RunResult {

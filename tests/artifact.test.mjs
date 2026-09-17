@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,6 +10,7 @@ process.env.DATCRAZY_HANDOFF_HOME = home;
 
 const {
   composeContinuationPrompt,
+  consumeSeed,
   cwdKey,
   listArtifacts,
   readArtifact,
@@ -40,7 +42,11 @@ test("writeHandoffArtifact persists a readable artifact and lists newest first",
   );
   const second = writeHandoffArtifact(
     { summary: "second" },
-    { cwd: CWD, now: new Date("2026-01-02T00:00:00Z") },
+    {
+      cwd: CWD,
+      now: new Date("2026-01-02T00:00:00Z"),
+      runtime: { provider: "captured", model: "live", thinking: "high" },
+    },
   );
 
   assert.ok(existsSync(first.path));
@@ -51,6 +57,11 @@ test("writeHandoffArtifact persists a readable artifact and lists newest first",
   assert.deepEqual(onDisk.artifacts, ["a.md"]);
   assert.deepEqual(onDisk.open_questions, ["q1"]);
   assert.match(onDisk.continuation_prompt, /first/);
+  assert.deepEqual(readArtifact(second.path).runtime, {
+    provider: "captured",
+    model: "live",
+    thinking: "high",
+  });
 
   const listed = listArtifacts(5);
   assert.equal(listed.length, 2);
@@ -89,10 +100,60 @@ test("seed lifecycle: write, read, take (one-shot), unlink", () => {
   assert.equal(readSeed(CWD), null);
   assert.equal(takeSeed(CWD), null);
 
-  writeSeed(CWD, "again");
+  writeSeed(CWD, "again", { runtime: { provider: "captured", model: "live", thinking: "high" } });
+  assert.deepEqual(readSeed(CWD).runtime, { provider: "captured", model: "live", thinking: "high" });
   unlinkSeed(CWD);
   assert.equal(readSeed(CWD), null);
   unlinkSeed(CWD); // idempotent
+});
+
+test("consuming a generation preserves same-millisecond publications from another process", () => {
+  const moduleUrl = new URL("../extensions/datcrazy-handoff/artifact.ts", import.meta.url).href;
+  const timestamp = "2026-09-17T15:00:00.000Z";
+  const publisher = `
+    import crypto from "node:crypto";
+    import { syncBuiltinESMExports } from "node:module";
+    crypto.randomBytes = (size) => Buffer.alloc(size, Number(process.argv[1]));
+    syncBuiltinESMExports();
+    const { writeSeed } = await import(process.argv[2]);
+    console.log(writeSeed(process.argv[3], process.argv[4], { now: new Date(process.argv[5]) }));
+  `;
+  // Exercise both random-suffix orders with identical timestamps. The suffix
+  // identifies a generation; it cannot say which process published first.
+  for (const [oldSuffix, newSuffix] of [[255, 0], [0, 255]]) {
+    const cwd = join(home, `same-millisecond-${oldSuffix}`);
+    const publish = (suffix, continuation) => {
+      const child = spawnSync(process.execPath, [
+        "--input-type=module", "-e", publisher,
+        String(suffix), moduleUrl, cwd, continuation, timestamp,
+      ], { encoding: "utf8" });
+      assert.equal(child.status, 0, child.stderr);
+      return child.stdout.trim();
+    };
+    const oldPath = publish(oldSuffix, "old continuation");
+    const captured = JSON.parse(readFileSync(oldPath, "utf8"));
+    const newPath = publish(newSuffix, "new continuation");
+    assert.equal(consumeSeed(cwd, JSON.stringify(captured)), true);
+    assert.equal(existsSync(newPath), true, "old completion must not consume its timestamp peer");
+    assert.equal(readSeed(cwd).continuation, "new continuation");
+    assert.equal(takeSeed(cwd).continuation, "new continuation");
+    assert.equal(readSeed(cwd), null);
+  }
+});
+
+test("a consumed-generation marker prevents stale recovery after interrupted cleanup", () => {
+  const cwd = join(home, "interrupted-generation-cleanup");
+  const oldPath = writeSeed(cwd, "superseded continuation", { now: new Date("2026-09-17T15:00:00.000Z") });
+  const newestPath = writeSeed(cwd, "delivered continuation", { now: new Date("2026-09-17T15:00:01.000Z") });
+  // Simulate a crash immediately after the delivered generation is consumed,
+  // before its older files can be cleaned up.
+  renameSync(newestPath, `${newestPath}.consumed`);
+  assert.equal(existsSync(oldPath), true);
+  assert.equal(readSeed(cwd), null);
+  assert.equal(takeSeed(cwd), null);
+  writeSeed(cwd, "subsequent handoff", { now: new Date("2026-09-17T15:00:02.000Z") });
+  assert.equal(takeSeed(cwd).continuation, "subsequent handoff");
+  assert.equal(readSeed(cwd), null);
 });
 
 test("a seed for another folder is not stolen", () => {

@@ -131,7 +131,14 @@ export function resolvePiEntry(argv: readonly string[] = process.argv): PiEntry 
  */
 export function buildSuccessorArgs(
   argv: readonly string[],
-  opts?: { sessionDir?: string; provider?: string; model?: string },
+  opts?: {
+    sessionDir?: string;
+    provider?: string;
+    model?: string;
+    thinking?: string;
+    /** Runtime metadata was persisted, so an omitted thinking is intentional. */
+    thinkingAuthoritative?: boolean;
+  },
 ): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
@@ -149,6 +156,14 @@ export function buildSuccessorArgs(
       continue;
     }
     if (KEPT_VALUE_FLAGS.has(arg)) {
+      // A captured runtime selection is authoritative. Do not carry stale
+      // launch flags from the parent when it switched models in-session.
+      if ((arg === "--provider" && opts?.provider) ||
+          (arg === "--model" && opts?.model) ||
+          (arg === "--thinking" && (opts?.thinkingAuthoritative || opts?.thinking))) {
+        i++;
+        continue;
+      }
       const value = argv[i + 1];
       push(arg);
       if (value !== undefined && !value.startsWith("-")) {
@@ -168,9 +183,10 @@ export function buildSuccessorArgs(
   if (opts?.sessionDir && !seen.has("--session-dir")) {
     out.push("--session-dir", opts.sessionDir);
   }
-  if (opts?.provider && opts?.model && !seen.has("--provider")) {
+  if (opts?.provider && opts?.model) {
     out.push("--provider", opts.provider, "--model", `${opts.provider}/${opts.model}`);
   }
+  if (opts?.thinking) out.push("--thinking", opts.thinking);
   out.push("--print");
   return out;
 }
@@ -205,6 +221,8 @@ export function spawnSuccessor(
     sessionDir?: string;
     provider?: string;
     model?: string;
+    thinking?: string;
+    thinkingAuthoritative?: boolean;
     argv?: readonly string[];
     env?: NodeJS.ProcessEnv;
   },
@@ -246,6 +264,8 @@ export function spawnSuccessor(
     sessionDir: spec.sessionDir,
     provider: spec.provider,
     model: spec.model,
+    thinking: spec.thinking,
+    thinkingAuthoritative: spec.thinkingAuthoritative,
   });
 
   let child: ReturnType<typeof nodeSpawn>;

@@ -1,6 +1,6 @@
 {
   "name": "datcrazy-handoff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Autonomous, durable session handoff for the Pi coding agent: summarize, swap to a fresh session, and continue without a human pressing /new.",
   "type": "module",
   "license": "MIT",

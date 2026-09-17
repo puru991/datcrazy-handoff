@@ -29,16 +29,20 @@ import { join } from "node:path";
 import { Type } from "typebox";
 
 import {
+  consumeSeed,
   handoffHome,
   listArtifacts,
   readArtifact,
   readSeed,
+  readSeedAtPath,
   resolveHandoffRoot,
   takeSeed,
   unlinkSeed,
   writeHandoffArtifact,
   writeSeed,
   type HandoffInput,
+  type HandoffRuntimeState,
+  type SeedRecord,
 } from "./artifact.ts";
 import { createHandoffController, type HandoffController, type NotifyLevel } from "./swap.ts";
 import { spawnSuccessor, type SpawnResult } from "./successor.ts";
@@ -64,6 +68,36 @@ function addonVersion(): string {
 }
 /** Well-known key other datcrazy addons use to reach this runtime. */
 const RUNTIME_KEY = Symbol.for("datcrazy-handoff.runtime.v1");
+const REPLACEMENT_COORDINATION_KEY = Symbol.for("datcrazy-handoff.replacement.v1");
+
+/** Plain cross-module coordination; never retain session-bound pi/ctx objects. */
+interface ReplacementOperation {
+  token: string;
+  cwd: string;
+  seedKey: string | null;
+}
+interface ReplacementCoordination {
+  operation: ReplacementOperation | null;
+  restoreAck: { token: string; payload: string } | null;
+}
+function replacementCoordination(): ReplacementCoordination {
+  const globals = globalThis as Record<symbol, unknown>;
+  const existing = globals[REPLACEMENT_COORDINATION_KEY] as ReplacementCoordination | undefined;
+  if (existing) return existing;
+  const created: ReplacementCoordination = { operation: null, restoreAck: null };
+  globals[REPLACEMENT_COORDINATION_KEY] = created;
+  return created;
+}
+function seedKey(seed: SeedRecord | null): string | null {
+  return seed ? JSON.stringify(seed) : null;
+}
+function ownsSeed(cwd: string, expected: string | null | undefined): boolean {
+  if (!expected) return false;
+  return seedKey(readSeed(cwd)) === expected;
+}
+function consumeOwnedSeed(cwd: string, expected: string | null | undefined): void {
+  if (expected) consumeSeed(cwd, expected);
+}
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -78,6 +112,7 @@ export interface SpawnOptions {
   sessionDir?: string;
   provider?: string;
   model?: string;
+  thinking?: string;
 }
 
 /** Test seam: the successor launcher is injected, like the pi instance is. */
@@ -87,6 +122,8 @@ let _spawnSuccessor: (spec: {
   sessionDir?: string;
   provider?: string;
   model?: string;
+  thinking?: string;
+  thinkingAuthoritative?: boolean;
 }) => SpawnResult = spawnSuccessor;
 
 export function _setSpawnForTest(fn: typeof _spawnSuccessor | null): void {
@@ -105,6 +142,9 @@ export interface HandoffRuntimeV1 {
       sessionDir?: string;
       provider?: string;
       model?: string;
+      thinking?: string;
+      /** Explicit captured state; otherwise the live addon context is captured. */
+      runtime?: HandoffRuntimeState;
       notify?: (text: string, level?: NotifyLevel) => void;
     },
   ): Promise<ArmStatus>;
@@ -114,7 +154,7 @@ export interface HandoffRuntimeV1 {
 // ── Session-scoped state (one module instance == one session) ───────────────
 
 let _pi: ExtensionAPI | null = null;
-let _liveCtx: Pick<ExtensionContext, "isIdle" | "cwd" | "ui"> | null = null;
+let _liveCtx: Pick<ExtensionContext, "isIdle" | "cwd" | "ui" | "model" | "modelRegistry" | "thinkingLevel" | "sessionManager"> | null = null;
 let _cmdCtx: ExtensionCommandContext | null = null;
 let _controller: HandoffController | null = null;
 let _armToken = "";
@@ -171,26 +211,43 @@ function sessionFileOf(ctx: Pick<ExtensionContext, "sessionManager"> | null): st
 
 // ── Controller ──────────────────────────────────────────────────────────────
 
-async function runSwap(armed: { text: string; cwd: string; parentSession?: string }): Promise<{
+async function runSwap(armed: { text: string; cwd: string; parentSession?: string; runtime?: HandoffRuntimeState; seedKey?: string }): Promise<{
   ok: boolean;
   cancelled?: boolean;
   reason?: string;
 }> {
   const ctx = _cmdCtx;
   if (!ctx) return { ok: false, reason: "no command context" };
-  // Consume the durable seed now: the replacement session must not replay it.
-  // A failed swap re-writes it in onFail.
-  unlinkSeed(armed.cwd);
+  const coordination = replacementCoordination();
+  const operation: ReplacementOperation = {
+    token: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    cwd: armed.cwd,
+    seedKey: armed.seedKey ?? null,
+  };
+  coordination.operation = operation;
+  coordination.restoreAck = null;
   try {
     const result = await ctx.newSession({
       parentSession: armed.parentSession || undefined,
       withSession: async (fresh) => {
-        notify("Handoff complete: continuing in a fresh session.", "info");
-        try {
-          await fresh.sendUserMessage(armed.text);
-        } catch {
-          // The replacement session already exists; the turn is its problem.
+        if (!ownsSeed(operation.cwd, operation.seedKey)) {
+          throw new Error("handoff seed was superseded before replacement restoration");
         }
+        // This is a registered extension command, not a built-in command. The
+        // replacement context dispatches it without an LLM turn, and the new
+        // extension instance's API restores the live model/thinking state.
+        const payload = encodeRestoreRequest(operation.token, armed.runtime);
+        await fresh.sendUserMessage(`/${COMMAND_NAME} __restore ${payload}`, { expandPromptTemplates: true });
+        const ack = replacementCoordination().restoreAck;
+        if (!ack || ack.token !== operation.token || ack.payload !== payload) {
+          throw new Error("replacement runtime restoration was not acknowledged");
+        }
+        if (!ownsSeed(operation.cwd, operation.seedKey)) {
+          throw new Error("handoff seed was superseded before continuation");
+        }
+        await fresh.sendUserMessage(armed.text);
+        consumeOwnedSeed(operation.cwd, operation.seedKey);
+        fresh.ui?.notify?.("Handoff complete: continuing in a fresh session.", "info");
       },
     });
     if (result?.cancelled) {
@@ -199,16 +256,72 @@ async function runSwap(armed: { text: string; cwd: string; parentSession?: strin
     return { ok: true };
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) };
+  } finally {
+    const current = replacementCoordination();
+    if (current.operation?.token === operation.token) {
+      current.operation = null;
+      current.restoreAck = null;
+    }
   }
 }
 
-async function runDeliver(armed: { text: string }): Promise<{
+function encodeRestoreRequest(token: string, runtime?: HandoffRuntimeState): string {
+  return Buffer.from(JSON.stringify({ token, runtime: runtime ?? null }), "utf8").toString("base64url");
+}
+
+function decodeRestoreRequest(payload: string): { token: string; runtime?: HandoffRuntimeState } {
+  const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+    token?: string;
+    runtime?: HandoffRuntimeState | null;
+  };
+  if (typeof parsed.token !== "string") throw new Error("invalid replacement token");
+  const runtime = parsed.runtime ?? undefined;
+  if (runtime && (typeof runtime.provider !== "string" || typeof runtime.model !== "string")) {
+    throw new Error("invalid runtime payload");
+  }
+  return { token: parsed.token, runtime };
+}
+
+async function restoreRuntimeForContext(
+  runtime: HandoffRuntimeState | undefined,
+  ctx: Pick<ExtensionContext, "modelRegistry">,
+): Promise<void> {
+  if (!runtime) return;
+  if (!_pi) throw new Error("replacement runtime is unavailable");
+  const model = ctx.modelRegistry.find(runtime.provider, runtime.model);
+  if (!model) throw new Error(`could not restore active model ${runtime.provider}/${runtime.model} (unavailable)`);
+  const selected = await _pi.setModel(model);
+  if (selected === false) throw new Error(`could not restore active model ${runtime.provider}/${runtime.model} (unauthenticated)`);
+  if (runtime.thinking) {
+    _pi.setThinkingLevel(runtime.thinking as never);
+    if (_pi.getThinkingLevel() !== runtime.thinking) {
+      throw new Error(`could not restore thinking level ${runtime.thinking} for ${runtime.provider}/${runtime.model}`);
+    }
+  }
+}
+
+async function restoreCurrentRuntime(runtime?: HandoffRuntimeState): Promise<void> {
+  await restoreRuntimeForContext(runtime, _liveCtx as Pick<ExtensionContext, "modelRegistry">);
+}
+
+async function runDeliver(armed: { text: string; cwd: string; runtime?: HandoffRuntimeState; seedKey?: string }): Promise<{
   ok: boolean;
   cancelled?: boolean;
   reason?: string;
 }> {
   try {
-    await _pi?.sendUserMessage(armed.text);
+    if (!_pi) throw new Error("live extension runtime is unavailable");
+    if (!ownsSeed(armed.cwd, armed.seedKey)) {
+      throw new Error("handoff seed was superseded before restoration");
+    }
+    await restoreCurrentRuntime(armed.runtime);
+    if (!ownsSeed(armed.cwd, armed.seedKey)) {
+      throw new Error("handoff seed was superseded before continuation");
+    }
+    await _pi.sendUserMessage(armed.text);
+    // Consume only the exact seed this delivery was armed for. A newer
+    // handoff written by the continuing session must remain untouched.
+    consumeOwnedSeed(armed.cwd, armed.seedKey);
     return { ok: true };
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) };
@@ -236,17 +349,13 @@ function controller(): HandoffController {
     },
     run: async (armed) => (armed.kind === "deliver" ? runDeliver(armed) : runSwap(armed)),
     notify,
-    onDone: (armed) => {
-      // A delivered seed is consumed only after it actually reached a session.
-      if (armed.kind === "deliver") unlinkSeed(armed.cwd);
+    onDone: () => {
+      // runSwap/runDeliver compare-and-consume the exact owned seed.
     },
-    onFail: (armed) => {
-      // Keep the handoff recoverable: rewrite the durable seed on any failure.
-      try {
-        writeSeed(armed.cwd, armed.text, { artifactPath: armed.artifactPath });
-      } catch {
-        /* best effort */
-      }
+    onFail: () => {
+      // The original generation remains on disk until successful delivery.
+      // Never rewrite a canonical path from a failure callback: another
+      // process may already have published a newer generation.
     },
   });
   return _controller;
@@ -271,6 +380,10 @@ interface ArmOptions {
   artifactPath?: string;
   notifyOverride?: (text: string, level?: NotifyLevel) => void;
   spawn?: SpawnOptions;
+  runtime?: HandoffRuntimeState;
+  seedKey?: string | null;
+  /** New handoffs must identify the live runtime; old seeds remain compatible. */
+  requireRuntime?: boolean;
 }
 
 /**
@@ -288,6 +401,21 @@ async function armContinuation(
   opts: ArmOptions,
 ): Promise<ArmStatus> {
   if (!_pi) return "unsupported";
+  const runtime = opts.runtime ?? (() => {
+    const selected = spawnOptionsFromCtx(_liveCtx);
+    return selected.provider && selected.model
+      ? { provider: selected.provider, model: selected.model, ...(selected.thinking ? { thinking: selected.thinking } : {}) }
+      : undefined;
+  })();
+  opts.runtime = runtime;
+  if (opts.requireRuntime && !runtime) return "unsupported";
+  try {
+    const publishedPath = writeSeed(opts.cwd, continuation, { artifactPath: opts.artifactPath, runtime });
+    opts.seedKey = seedKey(readSeedAtPath(publishedPath, opts.cwd));
+  } catch {
+    // The artifact remains available; swap failure will report the durable gap.
+    opts.seedKey = null;
+  }
   if (isPrintMode()) return spawnSuccessorFor(continuation, opts, "unsupported");
   const token = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   _armToken = token;
@@ -311,6 +439,8 @@ async function armContinuation(
     cwd: opts.cwd,
     parentSession: opts.parentSession,
     artifactPath: opts.artifactPath,
+    seedKey: opts.seedKey ?? undefined,
+    runtime: opts.runtime,
   });
   controller().kick();
   return "armed";
@@ -326,15 +456,20 @@ function spawnSuccessorFor(
   opts: ArmOptions,
   onFailure: ArmStatus,
 ): ArmStatus {
+  // Durable artifact/seed state is authoritative over launch flags and any
+  // stale interop options captured before the session changed models.
+  const runtime = opts.runtime;
   const result = _spawnSuccessor({
     cwd: opts.cwd,
     continuation,
     sessionDir: opts.spawn?.sessionDir,
-    provider: opts.spawn?.provider,
-    model: opts.spawn?.model,
+    provider: runtime?.provider ?? opts.spawn?.provider,
+    model: runtime?.model ?? opts.spawn?.model,
+    thinking: runtime?.thinking,
+    thinkingAuthoritative: Boolean(runtime),
   });
   if (!result.ok) return onFailure;
-  unlinkSeed(opts.cwd);
+  consumeOwnedSeed(opts.cwd, opts.seedKey);
   notify(
     `Handoff: successor session started in ${opts.cwd} (pid ${result.pid}). ` +
       `This process can stop; the work continues there. Log: ${result.logPath}`,
@@ -345,7 +480,7 @@ function spawnSuccessorFor(
 
 /** Session facts for a successor, read defensively off any ctx. */
 function spawnOptionsFromCtx(
-  ctx: Pick<ExtensionContext, "model" | "sessionManager"> | null,
+  ctx: Pick<ExtensionContext, "model" | "thinkingLevel" | "sessionManager"> | null,
 ): SpawnOptions {
   const out: SpawnOptions = {};
   try {
@@ -358,7 +493,16 @@ function spawnOptionsFromCtx(
       out.provider = model.provider;
       out.model = model.id;
     }
+    if (ctx?.thinkingLevel) out.thinking = ctx.thinkingLevel;
   } catch { /* best effort */ }
+  // Some hosts expose the effective level only through the live extension API.
+  // Read that API only while capturing the current runtime, never after replace.
+  if (!out.thinking) {
+    try {
+      const level = _pi?.getThinkingLevel?.();
+      if (level) out.thinking = level;
+    } catch { /* best effort */ }
+  }
   return out;
 }
 
@@ -372,16 +516,26 @@ async function armSwap(
     sessionDir?: string;
     provider?: string;
     model?: string;
+    thinking?: string;
+    runtime?: HandoffRuntimeState;
     notify?: (text: string, level?: NotifyLevel) => void;
   },
 ): Promise<ArmStatus> {
   if (!continuation?.trim()) return "unsupported";
+  const captured = spawnOptionsFromCtx(_liveCtx);
+  const runtime = opts?.runtime ?? (captured.provider && captured.model
+    ? { provider: captured.provider, model: captured.model, ...(captured.thinking ? { thinking: captured.thinking } : {}) }
+    : opts?.provider && opts?.model
+      ? { provider: opts.provider, model: opts.model, ...(opts.thinking ? { thinking: opts.thinking } : {}) }
+      : undefined);
   return await armContinuation(continuation, {
     cwd: opts?.cwd ?? currentCwd(),
     parentSession: opts?.parentSession,
     artifactPath: opts?.artifactPath,
     notifyOverride: opts?.notify,
-    spawn: { sessionDir: opts?.sessionDir, provider: opts?.provider, model: opts?.model },
+    spawn: { sessionDir: opts?.sessionDir, provider: captured.provider ?? opts?.provider, model: captured.model ?? opts?.model, thinking: captured.thinking ?? opts?.thinking },
+    runtime,
+    requireRuntime: true,
   });
 }
 
@@ -481,13 +635,25 @@ const extension = (pi: ExtensionAPI): void => {
         };
       }
 
+      const selected = spawnOptionsFromCtx(ctx);
+      const runtime = selected.provider && selected.model
+        ? { provider: selected.provider, model: selected.model, ...(selected.thinking ? { thinking: selected.thinking } : {}) }
+        : undefined;
+      if (!runtime) {
+        return {
+          content: [{ type: "text", text: "handoff could not capture the active provider/model; no continuation was armed." }],
+          details: { ok: false, code: "runtime_unavailable" },
+        };
+      }
       const written = writeHandoffArtifact(params, {
         cwd: rootDecision.root,
         sessionFile: sessionFileOf(ctx),
+        runtime,
       });
       try {
         writeSeed(rootDecision.root, written.artifact.continuation_prompt, {
           artifactPath: written.path,
+          runtime: written.artifact.runtime,
         });
       } catch (e) {
         return {
@@ -508,7 +674,9 @@ const extension = (pi: ExtensionAPI): void => {
         cwd: rootDecision.root,
         parentSession: written.artifact.session_file || undefined,
         artifactPath: written.path,
+        runtime: written.artifact.runtime,
         spawn: spawnOptionsFromCtx(ctx),
+        requireRuntime: true,
       });
 
       if (status === "armed") {
@@ -593,6 +761,20 @@ const extension = (pi: ExtensionAPI): void => {
         return;
       }
 
+      // Internal replacement hook. This is an extension command, so it runs
+      // against the fresh command context without dispatching an LLM turn.
+      if (head === "__restore") {
+        const request = decodeRestoreRequest(rest);
+        const coordination = replacementCoordination();
+        if (coordination.operation?.token !== request.token ||
+            !ownsSeed(coordination.operation.cwd, coordination.operation.seedKey)) {
+          throw new Error("replacement operation is no longer current");
+        }
+        await restoreRuntimeForContext(request.runtime, ctx);
+        coordination.restoreAck = { token: request.token, payload: rest };
+        return;
+      }
+
       if (head === "" || head === "status") {
         const state = controller().status();
         const seed = readSeed(cwd);
@@ -630,6 +812,7 @@ const extension = (pi: ExtensionAPI): void => {
       if (head === "resume") {
         let continuation = "";
         let artifactPath = "";
+        let runtime: HandoffRuntimeState | undefined;
         const pathMatch = /--path\s+(.+)$/.exec(rest);
         if (pathMatch) {
           const artifact = readArtifact(pathMatch[1]!.trim().replace(/^"|"$/g, ""));
@@ -639,6 +822,7 @@ const extension = (pi: ExtensionAPI): void => {
           }
           continuation = artifact.continuation_prompt;
           artifactPath = pathMatch[1]!.trim();
+          runtime = artifact.runtime;
         } else {
           const seed = readSeed(cwd);
           if (!seed) {
@@ -654,14 +838,17 @@ const extension = (pi: ExtensionAPI): void => {
             }
             continuation = artifact.continuation_prompt;
             artifactPath = newest.path;
+            runtime = artifact.runtime;
           } else {
             continuation = seed.continuation;
             artifactPath = seed.artifact_path;
+            runtime = seed.runtime;
           }
         }
         const status = await armContinuation(continuation, {
           cwd,
           artifactPath,
+          runtime,
           notifyOverride: (text, level) => ctx.ui?.notify?.(text, level ?? "info"),
           spawn: spawnOptionsFromCtx(ctx),
         });
@@ -699,6 +886,10 @@ const extension = (pi: ExtensionAPI): void => {
     resetController();
     announceLoad(ctx);
     const reason = (event as { reason?: string } | undefined)?.reason ?? "startup";
+    // The replacement callback drains this seed through the fresh extension
+    // command. Do not race it with the ordinary startup drain.
+    const activeOperation = replacementCoordination().operation;
+    if (reason === "new" && activeOperation?.cwd === safeCwd(ctx)) return;
     // Reload keeps the same session: replaying a seed there would double-deliver.
     if (reason === "reload" || isPrintMode()) return;
     const cwd = safeCwd(ctx);
@@ -711,6 +902,8 @@ const extension = (pi: ExtensionAPI): void => {
       text: seed.continuation,
       cwd,
       artifactPath: seed.artifact_path,
+      seedKey: seedKey(seed) ?? undefined,
+      runtime: seed.runtime,
     });
     controller().kick();
   });

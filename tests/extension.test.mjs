@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 const home = mkdtempSync(join(tmpdir(), "handoff-ext-"));
 process.env.DATCRAZY_HANDOFF_HOME = home;
@@ -17,6 +18,18 @@ const { readSeed, seedPathFor, writeHandoffArtifact, writeSeed } = await import(
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Publish through a genuinely separate Node process to exercise generation identity. */
+function publishExternalSeed(cwd, continuation, runtime) {
+  const artifactUrl = new URL("../extensions/datcrazy-handoff/artifact.ts", import.meta.url).href;
+  const script = `const { writeSeed } = await import(${JSON.stringify(artifactUrl)}); const runtime = process.env.TEST_SEED_RUNTIME ? JSON.parse(process.env.TEST_SEED_RUNTIME) : undefined; writeSeed(process.env.TEST_SEED_CWD, process.env.TEST_SEED_TEXT, { runtime });`;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: resolve(".."),
+    env: { ...process.env, TEST_SEED_CWD: cwd, TEST_SEED_TEXT: continuation, TEST_SEED_RUNTIME: runtime ? JSON.stringify(runtime) : "" },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr || "external seed publisher failed");
 }
 
 async function waitFor(predicate, { timeoutMs = 2000, stepMs = 5 } = {}) {
@@ -38,20 +51,28 @@ function freshCwd(label) {
  * `expandPromptTemplates` runs the registered command handler immediately, even
  * mid-turn, with a full command context.
  */
-function createHarness(cwd, { dispatchCommands = true } = {}) {
+function createHarness(cwd, { dispatchCommands = true, model = { provider: "live-provider", id: "live-model" }, thinkingLevel = "high" } = {}) {
   const state = {
     idle: false,
+    model,
+    thinkingLevel,
     tools: new Map(),
     commands: new Map(),
     events: new Map(),
     newSessionCalls: [],
     freshMessages: [],
     plainMessages: [],
+    deliveries: [],
     notified: [],
     statuses: new Map(),
     failNewSession: false,
     cancelNewSession: false,
+    simulateReplacement: true,
+    replacementExtension: null,
+    onFreshContinuation: null,
+    failFreshContinuation: false,
     parentSession: "/sessions/parent.jsonl",
+    models: model ? new Map([[`${model.provider}/${model.id}`, model]]) : new Map(),
   };
 
   const notify = (text, level) => state.notified.push({ text, level: level ?? "info" });
@@ -60,10 +81,20 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
     setStatus: (key, text) => state.statuses.set(key, text),
   };
 
+  const modelRegistry = {
+    find: (provider, id) => state.models.get(`${provider}/${id}`),
+  };
   const commandCtx = {
     get cwd() {
       return cwd;
     },
+    get model() {
+      return state.model;
+    },
+    get thinkingLevel() {
+      return state.thinkingLevel;
+    },
+    modelRegistry,
     ui,
     sessionManager: { getSessionFile: () => state.parentSession },
     isIdle: () => state.idle,
@@ -71,11 +102,37 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
       state.newSessionCalls.push(options);
       if (state.failNewSession) throw new Error("swap exploded");
       if (state.cancelNewSession) return { cancelled: true };
+      if (state.simulateReplacement) {
+        // Re-run the factory and startup hook to model Pi's fresh extension
+        // instance before invoking withSession.
+        (state.replacementExtension ?? extension)(pi);
+        await emit("session_start", { reason: "new" });
+      }
       const fresh = {
         cwd,
         ui,
-        async sendUserMessage(text) {
+        get model() {
+          return state.model;
+        },
+        get thinkingLevel() {
+          return state.thinkingLevel;
+        },
+        modelRegistry,
+        async sendUserMessage(text, options) {
+          if (dispatchCommands && options?.expandPromptTemplates && typeof text === "string" && text.startsWith("/")) {
+            const space = text.indexOf(" ");
+            const name = space === -1 ? text.slice(1) : text.slice(1, space);
+            const args = space === -1 ? "" : text.slice(space + 1);
+            const command = state.commands.get(name);
+            if (command) {
+              await command.handler(args, { ...commandCtx, cwd, modelRegistry, model: state.model, thinkingLevel: state.thinkingLevel });
+              return;
+            }
+          }
+          await state.onFreshContinuation?.(text);
+          if (state.failFreshContinuation) throw new Error("continuation rejected");
           state.freshMessages.push(text);
+          state.deliveries.push({ text, provider: state.model?.provider, model: state.model?.id, thinking: state.thinkingLevel });
         },
       };
       await options.withSession?.(fresh);
@@ -86,11 +143,24 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
   const ctx = {
     cwd,
     ui,
+    model: state.model,
+    thinkingLevel: state.thinkingLevel,
+    modelRegistry,
     sessionManager: { getSessionFile: () => state.parentSession },
     isIdle: () => state.idle,
   };
 
   const pi = {
+    async setModel(next) {
+      state.model = next;
+      return true;
+    },
+    getThinkingLevel() {
+      return state.thinkingLevel;
+    },
+    setThinkingLevel(level) {
+      state.thinkingLevel = level;
+    },
     registerTool(tool) {
       state.tools.set(tool.name, tool);
     },
@@ -125,6 +195,9 @@ function createHarness(cwd, { dispatchCommands = true } = {}) {
     return state.tools.get("handoff").execute("call-1", params, undefined, undefined, {
       cwd,
       ui,
+      model: state.model,
+      thinkingLevel: state.thinkingLevel,
+      modelRegistry,
       sessionManager: { getSessionFile: () => state.parentSession },
     });
   }
@@ -297,7 +370,7 @@ test("/datcrazy-handoff status, resume and cancel work from the command surface"
   await command.handler("list", harness.commandCtx);
   await command.handler("cancel", harness.commandCtx);
   assert.ok(
-    harness.state.notified.some((n) => /cancel/i.test(n.text)),
+    harness.state.notified.some((n) => /cancel|cleared|No pending/i.test(n.text)),
     "cancel reports the cleared state",
   );
   await waitFor(() => harness.state.notified.some((n) => /cancel/i.test(n.text)));
@@ -437,9 +510,134 @@ test("the interop runtime arms a swap for another addon", async () => {
   const status = await runtime.armSwap("delegated continuation", { cwd: harness.cwd });
   assert.equal(status, "armed");
   assert.equal(runtime.pending(), true);
+  assert.deepEqual(readSeed(harness.cwd).runtime, {
+    provider: "live-provider",
+    model: "live-model",
+    thinking: "high",
+  });
 
   harness.state.idle = true;
   await harness.emit("agent_settled", {});
   assert.equal(await waitFor(() => harness.state.freshMessages.length === 1), true);
   assert.equal(harness.state.freshMessages[0], "delegated continuation");
+  assert.deepEqual(harness.state.deliveries[0], {
+    text: "delegated continuation",
+    provider: "live-provider",
+    model: "live-model",
+    thinking: "high",
+  });
+});
+
+test("replacement restores captured runtime through the fresh extension command before continuation", async () => {
+  const harness = createHarness(freshCwd("fresh-runtime"), {
+    model: { provider: "captured-provider", id: "captured-model" },
+    thinkingLevel: "xhigh",
+  });
+  extension(harness.pi);
+  await boot(harness);
+  const result = await harness.callTool({ summary: "captured state" });
+  assert.equal(result.details.status, "armed");
+  harness.state.idle = true;
+  await harness.emit("agent_settled", {});
+  assert.equal(await waitFor(() => harness.state.freshMessages.length === 1), true);
+  assert.equal(harness.state.freshMessages[0].includes("captured state"), true);
+  assert.deepEqual(harness.state.deliveries[0], {
+    text: harness.state.freshMessages[0],
+    provider: "captured-provider",
+    model: "captured-model",
+    thinking: "xhigh",
+  });
+  assert.equal(harness.state.plainMessages.some((text) => /^(\/model|\/thinking)\b/.test(text)), false);
+});
+
+test("unavailable captured runtime sends no continuation and retains the seed", async () => {
+  const harness = createHarness(freshCwd("unavailable-runtime"));
+  extension(harness.pi);
+  await boot(harness);
+  const result = await harness.callTool({ summary: "must not prompt" });
+  assert.equal(result.details.status, "armed");
+  harness.state.models.clear();
+  harness.state.idle = true;
+  await harness.emit("agent_settled", {});
+  assert.equal(await waitFor(() => harness.state.notified.some((n) => n.level === "error")), true);
+  assert.equal(harness.state.freshMessages.length, 0, "failed model selection must not send an LLM prompt");
+  assert.ok(readSeed(harness.cwd), "failed selection keeps the seed recoverable");
+});
+
+test("resume uses saved runtime over the model selected by the launching shell", async () => {
+  const target = { provider: "saved-provider", id: "saved-model" };
+  const harness = createHarness(freshCwd("saved-runtime"), {
+    model: { provider: "stale-provider", id: "stale-model" },
+    thinkingLevel: "low",
+  });
+  harness.state.models.set("saved-provider/saved-model", target);
+  extension(harness.pi);
+  await boot(harness);
+  writeSeed(harness.cwd, "resume with saved state", {
+    runtime: { provider: "saved-provider", model: "saved-model", thinking: "high" },
+  });
+  await harness.state.commands.get("datcrazy-handoff").handler("resume", harness.commandCtx);
+  harness.state.idle = true;
+  await harness.emit("agent_settled", {});
+  assert.equal(await waitFor(() => harness.state.freshMessages.length === 1), true);
+  assert.deepEqual(harness.state.deliveries[0], {
+    text: "resume with saved state",
+    provider: "saved-provider",
+    model: "saved-model",
+    thinking: "high",
+  });
+});
+
+test("new handoffs fail explicitly when the live runtime cannot be captured", async () => {
+  const harness = createHarness(freshCwd("missing-runtime"), { model: null });
+  extension(harness.pi);
+  await boot(harness);
+  const result = await harness.callTool({ summary: "no runtime" });
+  assert.equal(result.details.code, "runtime_unavailable");
+  assert.equal(readSeed(harness.cwd), null);
+});
+
+test("cache-busted fresh addon module coordinates restoration and preserves a newer seed", async () => {
+  const freshModule = await import(`../extensions/datcrazy-handoff/index.ts?fresh=${Date.now()}-success`);
+  const harness = createHarness(freshCwd("cross-module-success"));
+  harness.state.replacementExtension = freshModule.default;
+  harness.state.onFreshContinuation = async () => {
+    publishExternalSeed(harness.cwd, "next handoff from continuing session", {
+      provider: "next-provider",
+      model: "next-model",
+      thinking: "low",
+    });
+  };
+  extension(harness.pi);
+  await boot(harness);
+  await harness.callTool({ summary: "old continuation" });
+  harness.state.idle = true;
+  await harness.emit("agent_settled", {});
+  assert.equal(await waitFor(() => harness.state.freshMessages.length === 1), true);
+  assert.equal(readSeed(harness.cwd).continuation, "next handoff from continuing session");
+  assert.deepEqual(readSeed(harness.cwd).runtime, {
+    provider: "next-provider",
+    model: "next-model",
+    thinking: "low",
+  });
+});
+
+test("cache-busted fresh module ACKs the old callback and does not overwrite a newer seed on rejection", async () => {
+  const freshModule = await import(`../extensions/datcrazy-handoff/index.ts?fresh=${Date.now()}-failure`);
+  const harness = createHarness(freshCwd("cross-module-failure"));
+  harness.state.replacementExtension = freshModule.default;
+  harness.state.onFreshContinuation = async () => {
+    publishExternalSeed(harness.cwd, "next handoff after rejection", {
+      provider: "next-provider",
+      model: "next-model",
+    });
+  };
+  harness.state.failFreshContinuation = true;
+  extension(harness.pi);
+  await boot(harness);
+  await harness.callTool({ summary: "rejected old continuation" });
+  harness.state.idle = true;
+  await harness.emit("agent_settled", {});
+  assert.equal(await waitFor(() => harness.state.notified.some((n) => n.level === "error")), true);
+  assert.equal(readSeed(harness.cwd).continuation, "next handoff after rejection");
 });

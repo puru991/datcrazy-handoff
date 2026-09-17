@@ -75,13 +75,22 @@ Three Pi constraints shape the design; each one is covered by a test.
 
 3. **A handoff must survive everything.** The artifact and the per-folder seed
    are written *before* any swap attempt, so a crash, a killed process, a native
-   `/new`, or a restart still resumes the work. A failed or cancelled swap
-   re-writes the seed; a delivered one consumes it. When the process cannot
+   `/new`, or a restart still resumes the work. Seeds publish through unique
+   temporary-file-plus-rename generations. A delivered or explicitly cancelled
+   generation is atomically renamed to its own `.consumed` marker; callbacks
+   never unlink or rewrite a newer generation. Failed swaps leave the original
+   generation in place for retry. When the process cannot
    replace its own session, a successor process continues the work instead — see
    below.
 
 Folder identity is canonicalized (realpath, slash style, case on Windows), so a
 handoff written at `C:/x/proj` is found by a session booting in `C:\x\proj`.
+
+The active provider/model and effective thinking level are captured from Pi's
+runtime (not tool arguments). Fresh in-process sessions restore that selection
+before the continuation prompt; detached successors and durable restart seeds
+carry the same metadata. Older artifacts and seeds without metadata remain
+readable and continue with normal Pi selection.
 
 ## When it cannot swap in place
 
@@ -108,12 +117,25 @@ The extension publishes its runtime on
 
 ```ts
 const runtime = globalThis[Symbol.for("datcrazy-handoff.runtime.v1")];
-const status = await runtime.armSwap(continuation, { cwd, parentSession, artifactPath, notify });
+const status = await runtime.armSwap(continuation, {
+  cwd,
+  parentSession,
+  artifactPath,
+  // Optional explicit state captured by the caller; omitted means the addon
+  // captures the live provider/model/thinking state itself.
+  runtime: { provider, model, thinking },
+  notify,
+});
 // "armed" | "no-command-ctx" | "unsupported"
 ```
 
 `datcrazy-remote` uses this: when this addon is installed, its `datcrazy_handoff`
 tool delegates the swap here instead of relying on a captured command context.
+The addon owns the artifact/seed and successor handoff. With no explicit
+`runtime`, `armSwap` captures the live extension context; explicit state is
+used when supplied. New handoffs without either live or explicit runtime are
+rejected, while older metadata-free seeds remain resumable with Pi's legacy
+selection behavior. Persisted runtime state always wins over launch flags.
 
 ## Configuration
 
@@ -135,8 +157,10 @@ Storage layout:
 ```
 ~/.pi/datcrazy/handoff/
   artifacts/<utc>-<slug>/handoff.json   # schema 1: summary, goal, artifacts, questions, continuation prompt
-  seeds/seed-<slug>-<hash>.json         # per-folder, one-shot continuation
-  logs/successor-<utc>.log              # output of successor processes
+  seeds/seed-<slug>-<hash>-<generation>.json  # immutable continuation generation
+  seeds/*.json.consumed                       # exact-generation consume markers
+  seeds/seed-<slug>-<hash>.json               # legacy metadata-free compatibility
+  logs/successor-<utc>.log                    # output of successor processes
 ```
 
 ## License

@@ -91,6 +91,38 @@ test("successor args keep capability flags and drop session/prompt flags", () =>
   assert.equal(args.at(-1), "--print");
 });
 
+test("captured runtime replaces stale launch provider, model and thinking flags", () => {
+  const args = buildSuccessorArgs([
+    "node", cliEntry,
+    "--provider", "stale-provider",
+    "--model", "stale-provider/stale-model",
+    "--thinking", "low",
+  ], {
+    provider: "captured-provider",
+    model: "captured-model",
+    thinking: "xhigh",
+  });
+  assert.equal(args.filter((arg) => arg === "--provider").length, 1);
+  assert.equal(args[args.indexOf("--provider") + 1], "captured-provider");
+  assert.equal(args[args.indexOf("--model") + 1], "captured-provider/captured-model");
+  assert.equal(args[args.indexOf("--thinking") + 1], "xhigh");
+});
+
+test("authoritative runtime without thinking drops stale launch thinking", () => {
+  const args = buildSuccessorArgs([
+    "node", cliEntry,
+    "--provider", "stale-provider",
+    "--model", "stale-provider/stale-model",
+    "--thinking", "low",
+  ], {
+    provider: "saved-provider",
+    model: "saved-model",
+    thinkingAuthoritative: true,
+  });
+  assert.equal(args.includes("--thinking"), false);
+  assert.match(args.join(" "), /--provider saved-provider --model saved-provider\/saved-model/);
+});
+
 test("successor args add the session dir and model when absent", () => {
   const args = buildSuccessorArgs(["node", cliEntry], {
     sessionDir: "D:/sessions/x",
